@@ -1,4 +1,4 @@
-Shadowrocket 小火箭 规则:
+## Shadowrocket 小火箭 规则:
 
 lhie1 规则: 
 https://github.com/lhie1/Rules/raw/master/Shadowrocket/Complete.conf
