@@ -54,12 +54,24 @@ if [ -n "$lsof_output" ]; then
     
     sleep 2
     
-    # 验证端口是否真正被释放
-    if lsof -n -P -i:"$SS_PORT" 2>/dev/null | grep -q "LISTEN"; then
-         echo "❌ 端口清理失败，仍有进程在监听。"
-         exit 1
-    else
-         echo "✅ 端口 $SS_PORT 已成功释放"
+    # 检查是否有 Docker 容器占用该端口
+    echo "🐳 检查 Docker 容器..."
+    DOCKER_CONTAINERS=$(docker ps --format "{{.ID}},{{.Names}}" 2>/dev/null | while read line; do
+        CONTAINER_ID=$(echo "$line" | cut -d',' -f1)
+        CONTAINER_NAME=$(echo "$line" | cut -d',' -f2)
+        if docker port $CONTAINER_ID 2>/dev/null | grep -q "$SS_PORT"; then
+            echo "$CONTAINER_NAME"
+        fi
+    done)
+    
+    if [ -n "$DOCKER_CONTAINERS" ]; then
+        echo "⚠️  发现以下 Docker 容器占用 $SS_PORT 端口:"
+        echo "$DOCKER_CONTAINERS"
+        echo "🛑 正在停止容器..."
+        echo "$DOCKER_CONTAINERS" | while read container_name; do
+            docker stop "$container_name" 2>/dev/null && echo "   ✅ 已停止: $container_name"
+        done
+        sleep 2
     fi
 else
     echo "✅ 端口 $SS_PORT 未被监听 (安全)"
