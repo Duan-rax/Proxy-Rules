@@ -1,63 +1,60 @@
 #!/bin/bash
 
 # ==================================================
-# Shadowsocks-Rust 部署脚本 (逻辑优化版)
+# Shadowsocks-Rust 部署脚本 (防误杀修复版)
 # ==================================================
 
 if [ "$(id -u)" != "0" ]; then echo "❌ 需 root 权限"; exit 1; fi
 
-# [交互环节]
+# [交互]
 echo "------------------------------------------------"
 read -p "👉 请输入 Shadowsocks 端口 (默认 443): " input_port
 SS_PORT=${input_port:-443}
 echo "------------------------------------------------"
 
-# [安装依赖]
+# [依赖]
 echo "📦 更新基础工具..."
-# 加入 lsof (端口检查) 和 procps (ps命令高级功能)
 apt-get update -qq && apt-get install -y -qq wget curl tar xz-utils openssl ca-certificates python3 lsof procps
 
 # ==================================================
-# [核心逻辑] 端口占用检测与处理
-# 参考自: wulabing/install.sh port_exist_check 函数
+# [核心逻辑] 端口占用检测 (精准识别 LISTEN)
 # ==================================================
 echo "🔍 正在检查端口 $SS_PORT..."
 
-# 1. 检测端口是否被监听 (参考 wulabing 逻辑)
-if [[ 0 -ne $(lsof -i:"$SS_PORT" | grep -i -c "listen") ]]; then
-    echo "⚠️  检测到 $SS_PORT 端口被占用，占用信息如下："
-    # 2. 打印占用详情 (让用户知道是谁)
-    lsof -i:"$SS_PORT"
+# 1. 检测端口是否被监听 (只看 LISTEN 状态)
+if [[ 0 -ne $(lsof -i:"$SS_PORT" -sTCP:LISTEN | grep -i -c "listen") ]]; then
+    echo "⚠️  检测到 $SS_PORT 端口被系统服务占用："
+    # 打印占用详情 (只显示监听者)
+    lsof -i:"$SS_PORT" -sTCP:LISTEN
     
     echo "------------------------------------------------"
-    echo "⏳ 3秒后将尝试自动停止相关进程..."
+    echo "⏳ 3秒后将尝试停止占用端口的服务..."
     sleep 3
 
-    # 3. 获取 PID 列表
-    # 使用 -t 参数直接获取纯 PID，比 awk 处理更稳健
-    PIDS=$(lsof -t -i:"$SS_PORT")
+    # 2. 获取 PID 列表 (关键修复：只获取 LISTEN 状态的 PID，防止误杀哪吒等客户端)
+    PIDS=$(lsof -t -i:"$SS_PORT" -sTCP:LISTEN)
     
-    for pid in $PIDS; do
-        # --- 智能升级：Systemd 服务反查 ---
-        # 很多时候 kill -9 杀不死由 Systemd 管理的服务(会自动重启)
-        # 这里我们通过 PID 反查它属于哪个服务，然后优雅停止
-        UNIT=$(ps -p $pid -o unit= 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//')
-        
-        if [[ -n "$UNIT" ]] && [[ "$UNIT" == *.service ]]; then
-            echo "💡 识别到进程属于系统服务: $UNIT"
-            echo "🛑 正在停止服务: $UNIT ..."
-            systemctl stop "$UNIT"
-            systemctl disable "$UNIT" 2>/dev/null
-        else
-            echo "🔪 进程不属于服务，执行强制处决 (PID: $pid)..."
-            kill -9 $pid 2>/dev/null
-        fi
-    done
+    if [ -n "$PIDS" ]; then
+        for pid in $PIDS; do
+            # Systemd 服务反查
+            UNIT=$(ps -p $pid -o unit= 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//')
+            
+            if [[ -n "$UNIT" ]] && [[ "$UNIT" == *.service ]]; then
+                echo "💡 识别到进程属于系统服务: $UNIT"
+                echo "🛑 正在停止服务: $UNIT ..."
+                systemctl stop "$UNIT"
+                systemctl disable "$UNIT" 2>/dev/null
+            else
+                echo "🔪 进程不属于服务，执行强制处决 (PID: $pid)..."
+                kill -9 $pid 2>/dev/null
+            fi
+        done
+    fi
     
     sleep 2
     
-    # 4. 二次验证结果
-    if [[ 0 -ne $(lsof -i:"$SS_PORT" | grep -i -c "listen") ]]; then
+    # 3. 二次验证结果
+    if [[ 0 -ne $(lsof -i:"$SS_PORT" -sTCP:LISTEN | grep -i -c "listen") ]]; then
          echo "❌ 端口清理失败，可能有顽固进程无法停止，请手动检查。"
          exit 1
     else
