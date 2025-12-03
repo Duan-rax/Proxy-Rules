@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==================================================
-# Shadowsocks-Rust 部署脚本 (Docker 安全保护版)
+# Shadowsocks-Rust 部署脚本 (只停不删版)
 # ==================================================
 
 if [ "$(id -u)" != "0" ]; then echo "❌ 需 root 权限"; exit 1; fi
@@ -17,21 +17,25 @@ echo "📦 更新基础工具..."
 apt-get update -qq && apt-get install -y -qq wget curl tar xz-utils openssl ca-certificates python3 lsof procps
 
 # ==================================================
-# [核心逻辑] 智能端口清理 (保护 Docker 守护进程)
+# [核心逻辑] 智能端口清理
 # ==================================================
 echo "🔍 正在检查端口 $SS_PORT..."
 
-# 1. 优先清理 Docker 容器 (将 Docker 清理提到最前，避免与本地进程冲突)
+# 1. 优先处理 Docker 容器 (只停止，不删除)
 if command -v docker >/dev/null 2>&1; then
-    # 直接查找映射了该端口的容器 ID
+    # 查找映射了该端口的容器 ID
     DOCKER_CONFLICTS=$(docker ps -q --filter "publish=$SS_PORT")
     
     if [ -n "$DOCKER_CONFLICTS" ]; then
-        echo "🐳 发现 Docker 容器占用端口，ID: $(echo $DOCKER_CONFLICTS | tr '\n' ' ')"
-        echo "🛑 正在停止并移除冲突容器..."
+        # 获取容器名字用于显示
+        CONTAINER_NAMES=$(docker ps --format "{{.Names}}" --filter "publish=$SS_PORT" | tr '\n' ' ')
+        echo "🐳 发现 Docker 容器占用端口: $CONTAINER_NAMES"
+        echo "⏸️  正在停止容器 (保留容器实例)..."
+        
+        # 仅执行 stop，不执行 rm
         docker stop $DOCKER_CONFLICTS >/dev/null 2>&1
-        docker rm $DOCKER_CONFLICTS >/dev/null 2>&1
-        echo "✅ 冲突容器已清理，Docker 守护进程保持运行"
+        
+        echo "✅ 容器已暂停，端口释放"
         sleep 2
     fi
 fi
@@ -54,16 +58,13 @@ if [ -n "$lsof_output" ]; then
             PROCESS_NAME=$(ps -p $pid -o comm= 2>/dev/null)
             UNIT=$(ps -p $pid -o unit= 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//')
             
-            # --- 关键修复：Docker 守护进程白名单 ---
+            # --- Docker 守护进程白名单 ---
             if [[ "$UNIT" == "docker.service" || "$UNIT" == "docker.socket" || "$UNIT" == "containerd.service" ]]; then
-                echo "🛡️  PID $pid ($PROCESS_NAME) 属于 Docker 核心组件，跳过 Systemd 停止操作..."
-                # 这里跳过是因为上面的 Docker 清理步骤可能已经处理了容器。
-                # 如果 docker-proxy 还在，说明是残留僵尸进程，下面会尝试 kill
-                echo "🔪 尝试直接终止残留的代理进程 (不影响 Daemon)..."
+                echo "🛡️  PID $pid ($PROCESS_NAME) 是 Docker 守护进程，跳过停止..."
+                # 尝试杀掉残留的 proxy 子进程，但不杀 Daemon
                 kill -9 $pid 2>/dev/null
                 continue
             fi
-            # ------------------------------------
             
             if [[ -n "$UNIT" ]] && [[ "$UNIT" == *.service ]]; then
                 echo "💡 PID $pid ($PROCESS_NAME) 属于服务: $UNIT"
@@ -71,7 +72,7 @@ if [ -n "$lsof_output" ]; then
                 systemctl stop "$UNIT" 2>/dev/null
                 systemctl disable "$UNIT" 2>/dev/null
             else
-                echo "🔪 PID $pid ($PROCESS_NAME) 不属于服务，强制处决..."
+                echo "🔪 PID $pid ($PROCESS_NAME) 不属于服务，强制停止..."
                 kill -9 $pid 2>/dev/null
             fi
         done
