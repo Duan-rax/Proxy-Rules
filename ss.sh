@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==================================================
-# Shadowsocks-Rust 部署脚本 (最终完美版)
+# Shadowsocks-Rust 部署脚本 (Docker 安全保护版)
 # ==================================================
 
 if [ "$(id -u)" != "0" ]; then echo "❌ 需 root 权限"; exit 1; fi
@@ -17,31 +17,53 @@ echo "📦 更新基础工具..."
 apt-get update -qq && apt-get install -y -qq wget curl tar xz-utils openssl ca-certificates python3 lsof procps
 
 # ==================================================
-# [核心逻辑] 端口占用检测 (仅处理 LISTEN 状态)
+# [核心逻辑] 智能端口清理 (保护 Docker 守护进程)
 # ==================================================
 echo "🔍 正在检查端口 $SS_PORT..."
 
-# 仅获取处于 LISTEN 状态的进程（监听端口的进程）
-# -n: 不解析主机名, -P: 不解析端口号 (加快速度)
+# 1. 优先清理 Docker 容器 (将 Docker 清理提到最前，避免与本地进程冲突)
+if command -v docker >/dev/null 2>&1; then
+    # 直接查找映射了该端口的容器 ID
+    DOCKER_CONFLICTS=$(docker ps -q --filter "publish=$SS_PORT")
+    
+    if [ -n "$DOCKER_CONFLICTS" ]; then
+        echo "🐳 发现 Docker 容器占用端口，ID: $(echo $DOCKER_CONFLICTS | tr '\n' ' ')"
+        echo "🛑 正在停止并移除冲突容器..."
+        docker stop $DOCKER_CONFLICTS >/dev/null 2>&1
+        docker rm $DOCKER_CONFLICTS >/dev/null 2>&1
+        echo "✅ 冲突容器已清理，Docker 守护进程保持运行"
+        sleep 2
+    fi
+fi
+
+# 2. 清理本地残留进程 (Systemd/Binary)
 lsof_output=$(lsof -n -P -i:"$SS_PORT" 2>/dev/null | grep "(LISTEN)")
 
 if [ -n "$lsof_output" ]; then
-    echo "⚠️  检测到 $SS_PORT 端口被以下服务监听："
-    # 优化显示格式: 进程名 PID 用户 状态
+    echo "⚠️  检测到 $SS_PORT 端口仍被以下服务监听："
     echo "$lsof_output" | awk '{print $1, "(PID: " $2 ")", "User: " $3, "State: " $NF}'
     
     echo "------------------------------------------------"
-    echo "⏳ 3秒后将尝试停止监听进程 (Ctrl+C 可取消)..."
+    echo "⏳ 3秒后将尝试停止监听进程..."
     sleep 3
 
-    # 只提取 LISTEN 状态的 PID
     PIDS=$(echo "$lsof_output" | awk '{print $2}' | sort -u)
     
     if [ -n "$PIDS" ]; then
         for pid in $PIDS; do
             PROCESS_NAME=$(ps -p $pid -o comm= 2>/dev/null)
-            # Systemd 服务反查
             UNIT=$(ps -p $pid -o unit= 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//')
+            
+            # --- 关键修复：Docker 守护进程白名单 ---
+            if [[ "$UNIT" == "docker.service" || "$UNIT" == "docker.socket" || "$UNIT" == "containerd.service" ]]; then
+                echo "🛡️  PID $pid ($PROCESS_NAME) 属于 Docker 核心组件，跳过 Systemd 停止操作..."
+                # 这里跳过是因为上面的 Docker 清理步骤可能已经处理了容器。
+                # 如果 docker-proxy 还在，说明是残留僵尸进程，下面会尝试 kill
+                echo "🔪 尝试直接终止残留的代理进程 (不影响 Daemon)..."
+                kill -9 $pid 2>/dev/null
+                continue
+            fi
+            # ------------------------------------
             
             if [[ -n "$UNIT" ]] && [[ "$UNIT" == *.service ]]; then
                 echo "💡 PID $pid ($PROCESS_NAME) 属于服务: $UNIT"
@@ -49,31 +71,15 @@ if [ -n "$lsof_output" ]; then
                 systemctl stop "$UNIT" 2>/dev/null
                 systemctl disable "$UNIT" 2>/dev/null
             else
-                echo "🔪 PID $pid ($PROCESS_NAME) 不属于服务，强制杀死..."
+                echo "🔪 PID $pid ($PROCESS_NAME) 不属于服务，强制处决..."
                 kill -9 $pid 2>/dev/null
             fi
         done
     fi
-    
     sleep 2
 fi
 
-# [Docker 深度清理] 使用原生过滤器，效率更高
-if command -v docker >/dev/null 2>&1; then
-    echo "🐳 检查 Docker 容器占用..."
-    # 直接查找映射了该端口的容器 ID
-    DOCKER_CONFLICTS=$(docker ps -q --filter "publish=$SS_PORT")
-    
-    if [ -n "$DOCKER_CONFLICTS" ]; then
-        echo "⚠️  发现 Docker 容器占用 $SS_PORT，ID: $(echo $DOCKER_CONFLICTS | tr '\n' ' ')"
-        echo "🛑 正在停止并移除容器..."
-        docker stop $DOCKER_CONFLICTS >/dev/null 2>&1
-        docker rm $DOCKER_CONFLICTS >/dev/null 2>&1
-        echo "✅ 容器已清理"
-    fi
-fi
-
-# 二次验证 (确保端口真的空了)
+# 二次验证
 if lsof -n -P -i:"$SS_PORT" 2>/dev/null | grep -q "(LISTEN)"; then
     echo "❌ 端口清理失败！仍有进程在监听 $SS_PORT"
     exit 1
@@ -134,17 +140,15 @@ EOF
 systemctl daemon-reload && systemctl enable shadowsocks-rust && systemctl restart shadowsocks-rust
 
 # ==================================================
-# [标准分享格式输出]
+# [输出信息]
 # ==================================================
 echo "🌍 正在识别位置..."
 PUBLIC_IP=$(curl -4s ifconfig.me)
 
-# 获取地理位置信息
 API_JSON=$(curl -s "http://ip-api.com/json/${PUBLIC_IP}")
 COUNTRY_CODE=$(echo "$API_JSON" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('countryCode', 'UN'))")
 COUNTRY=$(echo "$API_JSON" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('country', 'Unknown'))")
 
-# 生成 emoji 国旗
 FLAG=$(python3 -c "
 try:
     flag = ''.join([chr(ord(c) + 127397) for c in '${COUNTRY_CODE}'.upper()])
@@ -153,17 +157,11 @@ except:
     print('🏳️')
 ")
 
-# 生成标准 SS URI
 RAW_STR="${SS_METHOD}:${SS_PASSWORD}@${PUBLIC_IP}:${SS_PORT}"
 B64_STR=$(echo -n "${RAW_STR}" | base64 -w 0)
 SS_URI="ss://${B64_STR}#${FLAG}${COUNTRY_CODE}"
-
-# 生成简化格式
 SS_URI_ALT="${SS_METHOD}://${SS_PASSWORD}@${PUBLIC_IP}:${SS_PORT}"
 
-# ==================================================
-# [输出信息]
-# ==================================================
 echo ""
 echo "╔════════════════════════════════════════════════════╗"
 echo "║            ✅ Shadowsocks 部署成功！               ║"
@@ -188,17 +186,5 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "🔗 简化格式 (备用):"
 echo ""
 echo "${SS_URI_ALT}"
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📋 JSON 配置 (高级客户端使用):"
-echo ""
-echo "{\"server\":\"${PUBLIC_IP}\",\"server_port\":${SS_PORT},\"password\":\"${SS_PASSWORD}\",\"method\":\"${SS_METHOD}\"}"
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "💡 使用方式:"
-echo "   • 复制上面的 URI 链接到客户端"
-echo "   • 支持 Sub-Store、Clash、V2rayNG 等工具"
-echo "   • 配置文件位置: /etc/shadowsocks-rust/config.json"
-echo "   • 服务管理: systemctl {start|stop|restart} shadowsocks-rust"
 echo ""
 echo "════════════════════════════════════════════════════"
