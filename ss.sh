@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==================================================
-# Shadowsocks-Rust 部署脚本 (标准分享格式输出)
+# Shadowsocks-Rust 部署脚本 (最终完美版)
 # ==================================================
 
 if [ "$(id -u)" != "0" ]; then echo "❌ 需 root 权限"; exit 1; fi
@@ -22,14 +22,16 @@ apt-get update -qq && apt-get install -y -qq wget curl tar xz-utils openssl ca-c
 echo "🔍 正在检查端口 $SS_PORT..."
 
 # 仅获取处于 LISTEN 状态的进程（监听端口的进程）
-lsof_output=$(lsof -n -P -i:"$SS_PORT" 2>/dev/null | grep "LISTEN")
+# -n: 不解析主机名, -P: 不解析端口号 (加快速度)
+lsof_output=$(lsof -n -P -i:"$SS_PORT" 2>/dev/null | grep "(LISTEN)")
 
 if [ -n "$lsof_output" ]; then
     echo "⚠️  检测到 $SS_PORT 端口被以下服务监听："
-    echo "$lsof_output" | awk '{print $1, "PID:", $2, "STATE:", $(NF-1)}'
+    # 优化显示格式: 进程名 PID 用户 状态
+    echo "$lsof_output" | awk '{print $1, "(PID: " $2 ")", "User: " $3, "State: " $NF}'
     
     echo "------------------------------------------------"
-    echo "⏳ 3秒后将尝试停止监听进程..."
+    echo "⏳ 3秒后将尝试停止监听进程 (Ctrl+C 可取消)..."
     sleep 3
 
     # 只提取 LISTEN 状态的 PID
@@ -38,6 +40,7 @@ if [ -n "$lsof_output" ]; then
     if [ -n "$PIDS" ]; then
         for pid in $PIDS; do
             PROCESS_NAME=$(ps -p $pid -o comm= 2>/dev/null)
+            # Systemd 服务反查
             UNIT=$(ps -p $pid -o unit= 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//')
             
             if [[ -n "$UNIT" ]] && [[ "$UNIT" == *.service ]]; then
@@ -53,28 +56,29 @@ if [ -n "$lsof_output" ]; then
     fi
     
     sleep 2
+fi
+
+# [Docker 深度清理] 使用原生过滤器，效率更高
+if command -v docker >/dev/null 2>&1; then
+    echo "🐳 检查 Docker 容器占用..."
+    # 直接查找映射了该端口的容器 ID
+    DOCKER_CONFLICTS=$(docker ps -q --filter "publish=$SS_PORT")
     
-    # 检查是否有 Docker 容器占用该端口
-    echo "🐳 检查 Docker 容器..."
-    DOCKER_CONTAINERS=$(docker ps --format "{{.ID}},{{.Names}}" 2>/dev/null | while read line; do
-        CONTAINER_ID=$(echo "$line" | cut -d',' -f1)
-        CONTAINER_NAME=$(echo "$line" | cut -d',' -f2)
-        if docker port $CONTAINER_ID 2>/dev/null | grep -q "$SS_PORT"; then
-            echo "$CONTAINER_NAME"
-        fi
-    done)
-    
-    if [ -n "$DOCKER_CONTAINERS" ]; then
-        echo "⚠️  发现以下 Docker 容器占用 $SS_PORT 端口:"
-        echo "$DOCKER_CONTAINERS"
-        echo "🛑 正在停止容器..."
-        echo "$DOCKER_CONTAINERS" | while read container_name; do
-            docker stop "$container_name" 2>/dev/null && echo "   ✅ 已停止: $container_name"
-        done
-        sleep 2
+    if [ -n "$DOCKER_CONFLICTS" ]; then
+        echo "⚠️  发现 Docker 容器占用 $SS_PORT，ID: $(echo $DOCKER_CONFLICTS | tr '\n' ' ')"
+        echo "🛑 正在停止并移除容器..."
+        docker stop $DOCKER_CONFLICTS >/dev/null 2>&1
+        docker rm $DOCKER_CONFLICTS >/dev/null 2>&1
+        echo "✅ 容器已清理"
     fi
+fi
+
+# 二次验证 (确保端口真的空了)
+if lsof -n -P -i:"$SS_PORT" 2>/dev/null | grep -q "(LISTEN)"; then
+    echo "❌ 端口清理失败！仍有进程在监听 $SS_PORT"
+    exit 1
 else
-    echo "✅ 端口 $SS_PORT 未被监听 (安全)"
+    echo "✅ 端口 $SS_PORT 准备就绪"
 fi
 
 # ==================================================
@@ -149,12 +153,12 @@ except:
     print('🏳️')
 ")
 
-# 生成标准 SS URI (ss://method:password@server:port#name)
+# 生成标准 SS URI
 RAW_STR="${SS_METHOD}:${SS_PASSWORD}@${PUBLIC_IP}:${SS_PORT}"
 B64_STR=$(echo -n "${RAW_STR}" | base64 -w 0)
 SS_URI="ss://${B64_STR}#${FLAG}${COUNTRY_CODE}"
 
-# 生成另一种格式 (method://password@ip:port)
+# 生成简化格式
 SS_URI_ALT="${SS_METHOD}://${SS_PASSWORD}@${PUBLIC_IP}:${SS_PORT}"
 
 # ==================================================
@@ -162,7 +166,7 @@ SS_URI_ALT="${SS_METHOD}://${SS_PASSWORD}@${PUBLIC_IP}:${SS_PORT}"
 # ==================================================
 echo ""
 echo "╔════════════════════════════════════════════════════╗"
-echo "║           ✅ Shadowsocks 部署成功！                ║"
+echo "║            ✅ Shadowsocks 部署成功！               ║"
 echo "╚════════════════════════════════════════════════════╝"
 echo ""
 echo "📍 服务器信息："
